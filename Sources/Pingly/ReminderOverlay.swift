@@ -76,6 +76,18 @@ final class ReminderOverlayCoordinator: NSObject, NSWindowDelegate {
             )
             return true
         }
+
+        // A preview may be requested while another reminder is still crossing
+        // the screen. Keep that reminder's text, but release its character
+        // before starting the preview. Two independently timed sprites drawn
+        // over the same route look like skipped or frozen hatch-pet frames even
+        // though each playback is sequential.
+        if CharacterAnimationLoader.movementAnimation(
+            for: character,
+            movesRight: true
+        ) != nil {
+            demoteMovingCharacterToText()
+        }
         return addMovingPresentation(
             reminder: reminder,
             character: character,
@@ -278,6 +290,7 @@ final class ReminderOverlayCoordinator: NSObject, NSWindowDelegate {
     private func removeMovingPresentation(id: UUID) {
         removalWorkItems[id]?.cancel()
         removalWorkItems[id] = nil
+        movingStore.items.first(where: { $0.id == id })?.animationPlayback.stop()
         movingStore.items.removeAll { $0.id == id }
         if movingStore.items.isEmpty {
             movingPanel?.orderOut(nil)
@@ -310,6 +323,7 @@ final class ReminderOverlayCoordinator: NSObject, NSWindowDelegate {
         movingStore.items = movingStore.items.map { item in
             guard item.animation != nil else { return item }
             var updated = item
+            updated.animationPlayback.stop()
             updated.animation = nil
             return updated
         }
@@ -782,11 +796,34 @@ private struct MovingReminderPresentation: Identifiable {
     let id = UUID()
     let reminder: ReminderItem
     var animation: CharacterAnimation?
+    let animationPlayback: SequentialAnimationPlaybackController
     var characterHeight: CGFloat
     let route: OverlayRoute
     let startDate: Date
     let duration: TimeInterval
     let role: MovingPresentationRole
+
+    init(
+        reminder: ReminderItem,
+        animation: CharacterAnimation?,
+        characterHeight: CGFloat,
+        route: OverlayRoute,
+        startDate: Date,
+        duration: TimeInterval,
+        role: MovingPresentationRole
+    ) {
+        self.reminder = reminder
+        self.animation = animation
+        self.characterHeight = characterHeight
+        self.route = route
+        self.startDate = startDate
+        self.duration = duration
+        self.role = role
+        animationPlayback = SequentialAnimationPlaybackController(
+            animation: animation,
+            startDate: startDate
+        )
+    }
 }
 
 @MainActor
@@ -824,27 +861,37 @@ private struct MovingOverlayView: View {
         GeometryReader { _ in
             TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { timeline in
                 ForEach(store.items) { item in
-                    movingItem(item, at: timeline.date)
+                    MovingOverlayItemView(item: item, date: timeline.date)
                 }
             }
         }
         .background(Color.clear)
     }
+}
 
-    @ViewBuilder
-    private func movingItem(_ item: MovingReminderPresentation, at date: Date) -> some View {
+private struct MovingOverlayItemView: View {
+    let item: MovingReminderPresentation
+    let date: Date
+
+    @ObservedObject private var playback: SequentialAnimationPlaybackController
+
+    init(item: MovingReminderPresentation, date: Date) {
+        self.item = item
+        self.date = date
+        _playback = ObservedObject(wrappedValue: item.animationPlayback)
+    }
+
+    var body: some View {
         let elapsed = max(0, date.timeIntervalSince(item.startDate))
         let progress = date < item.startDate ? 0 : min(1, elapsed / item.duration)
         let point = item.route.point(at: progress)
-        let frameIndex = item.animation?.frameIndex(at: elapsed) ?? 0
-        let image = item.animation.flatMap { animation in
-            animation.frames.indices.contains(frameIndex) ? animation.frames[frameIndex] : nil
-        }
+        let frameIndex = item.animation.map {
+            min(playback.frameIndex, max(0, $0.frames.count - 1))
+        } ?? 0
 
         ReminderBubble(
             reminder: item.reminder,
-            image: image,
-            mirrorsForDirection: item.animation?.mirrorsForDirection == true,
+            animation: item.animation,
             movesRight: item.route.movesRight,
             frameIndex: frameIndex,
             characterHeight: item.characterHeight
@@ -853,13 +900,96 @@ private struct MovingOverlayView: View {
     }
 }
 
+private struct HatchPetSpriteFrameView: NSViewRepresentable {
+    let frame: NSImage
+
+    func makeNSView(context: Context) -> HatchPetSpriteFrameNSView {
+        HatchPetSpriteFrameNSView()
+    }
+
+    func updateNSView(_ nsView: HatchPetSpriteFrameNSView, context: Context) {
+        nsView.update(frame: frame)
+    }
+}
+
+private final class HatchPetSpriteFrameNSView: NSView {
+    override var isFlipped: Bool { true }
+
+    override func makeBackingLayer() -> CALayer {
+        let backingLayer = CALayer()
+        backingLayer.contentsGravity = .resize
+        backingLayer.minificationFilter = .linear
+        backingLayer.magnificationFilter = .linear
+        return backingLayer
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layerContentsRedrawPolicy = .never
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        wantsLayer = true
+        layerContentsRedrawPolicy = .never
+    }
+
+    func update(frame: NSImage) {
+        var proposedRect = NSRect(origin: .zero, size: frame.size)
+        let frameImage = frame.cgImage(
+            forProposedRect: &proposedRect,
+            context: nil,
+            hints: nil
+        )
+        // A sprite frame is a discrete state, never an animatable layer
+        // transition. Cross-fading adjacent poses blends the two legs together
+        // and makes a correct alternating gait look visually frozen.
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer?.contents = frameImage
+        CATransaction.commit()
+    }
+}
+
 private struct ReminderBubble: View {
     let reminder: ReminderItem
-    let image: NSImage?
-    let mirrorsForDirection: Bool
+    let animation: CharacterAnimation?
     let movesRight: Bool
     let frameIndex: Int
     let characterHeight: CGFloat
+
+    private var hasCharacterFrame: Bool {
+        guard let animation else { return false }
+        return animation.frames.indices.contains(frameIndex)
+    }
+
+    @ViewBuilder
+    private var characterFrame: some View {
+        if let animation,
+           animation.usesLayerBackedFrames,
+           animation.frames.indices.contains(frameIndex) {
+            HatchPetSpriteFrameView(
+                frame: animation.frames[frameIndex]
+            )
+            .frame(
+                width: characterHeight * CGFloat(HatchPetAtlas.cellWidth) / CGFloat(HatchPetAtlas.cellHeight),
+                height: characterHeight
+            )
+            .frame(width: characterHeight, height: characterHeight)
+            .scaleEffect(x: animation.mirrorsForDirection && !movesRight ? -1 : 1, y: 1)
+            .offset(y: animation.mirrorsForDirection && frameIndex != 0 ? -2 : 0)
+        } else if let animation,
+                  animation.frames.indices.contains(frameIndex) {
+            Image(nsImage: animation.frames[frameIndex])
+                .resizable()
+                .scaledToFit()
+                .frame(width: characterHeight, height: characterHeight)
+                .scaleEffect(x: animation.mirrorsForDirection && !movesRight ? -1 : 1, y: 1)
+                .offset(y: animation.mirrorsForDirection && frameIndex != 0 ? -2 : 0)
+                .id(frameIndex)
+        }
+    }
 
     var body: some View {
         let text = Text(reminder.title)
@@ -877,23 +1007,16 @@ private struct ReminderBubble: View {
                     )
             )
 
-        if let image {
-            let character = Image(nsImage: image)
-                .resizable()
-                .scaledToFit()
-                .frame(width: characterHeight, height: characterHeight)
-                .scaleEffect(x: mirrorsForDirection && !movesRight ? -1 : 1, y: 1)
-                .offset(y: mirrorsForDirection && frameIndex != 0 ? -2 : 0)
-
+        if hasCharacterFrame {
             switch reminder.textPosition {
-            case .above: VStack(spacing: 3) { text; character }
-            case .below: VStack(spacing: 3) { character; text }
+            case .above: VStack(spacing: 3) { text; characterFrame }
+            case .below: VStack(spacing: 3) { characterFrame; text }
             case .behind:
-                if movesRight { HStack(spacing: 4) { text; character } }
-                else { HStack(spacing: 4) { character; text } }
+                if movesRight { HStack(spacing: 4) { text; characterFrame } }
+                else { HStack(spacing: 4) { characterFrame; text } }
             case .ahead:
-                if movesRight { HStack(spacing: 4) { character; text } }
-                else { HStack(spacing: 4) { text; character } }
+                if movesRight { HStack(spacing: 4) { characterFrame; text } }
+                else { HStack(spacing: 4) { text; characterFrame } }
             }
         } else {
             text
@@ -933,13 +1056,9 @@ private struct WaitingReminderView: View {
                     TimelineView(.animation(minimumInterval: 1.0 / 15.0)) { timeline in
                         let elapsed = timeline.date.timeIntervalSinceReferenceDate
                         let index = animation.frameIndex(at: elapsed)
-                        let image = animation.frames.indices.contains(index)
-                            ? animation.frames[index]
-                            : nil
                         ReminderBubble(
                             reminder: reminder,
-                            image: image,
-                            mirrorsForDirection: animation.mirrorsForDirection,
+                            animation: animation,
                             movesRight: store.movesRight,
                             frameIndex: index,
                             characterHeight: store.characterHeight
@@ -948,8 +1067,7 @@ private struct WaitingReminderView: View {
                 } else {
                     ReminderBubble(
                         reminder: reminder,
-                        image: nil,
-                        mirrorsForDirection: false,
+                        animation: nil,
                         movesRight: store.movesRight,
                         frameIndex: 0,
                         characterHeight: store.characterHeight

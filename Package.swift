@@ -15,6 +15,11 @@ let package = Package(
             linkerSettings: [
                 .linkedFramework("ServiceManagement")
             ]
+        ),
+        .testTarget(
+            name: "PinglyTests",
+            dependencies: ["Pingly"],
+            path: "Tests/PinglyTests"
         )
     ]
 )

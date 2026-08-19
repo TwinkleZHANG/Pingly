@@ -1,10 +1,33 @@
 import AppKit
+import Combine
 import Foundation
 
 struct CharacterAnimation {
+    let playbackID = UUID()
     let frames: [NSImage]
     let frameDurations: [TimeInterval]
     let mirrorsForDirection: Bool
+    let usesLayerBackedFrames: Bool
+
+    init(
+        frames: [NSImage],
+        frameDurations: [TimeInterval],
+        mirrorsForDirection: Bool,
+        usesLayerBackedFrames: Bool = false
+    ) {
+        self.frames = frames
+        self.frameDurations = frameDurations
+        self.mirrorsForDirection = mirrorsForDirection
+        self.usesLayerBackedFrames = usesLayerBackedFrames
+    }
+
+    func frameDuration(at index: Int) -> TimeInterval {
+        guard frames.indices.contains(index) else { return 0.16 }
+        let duration = frameDurations.count == frames.count
+            ? frameDurations[index]
+            : 0.16
+        return duration > 0 ? duration : 0.16
+    }
 
     func frameIndex(at elapsed: TimeInterval) -> Int {
         guard !frames.isEmpty else { return 0 }
@@ -20,6 +43,87 @@ struct CharacterAnimation {
             position -= duration
         }
         return frames.count - 1
+    }
+}
+
+struct SequentialFramePlayback {
+    private(set) var frameIndex = 0
+    private var nextFrameDate: Date?
+    private var animationID: UUID?
+
+    mutating func start(animation: CharacterAnimation, at date: Date) {
+        animationID = animation.playbackID
+        frameIndex = 0
+        nextFrameDate = date.addingTimeInterval(animation.frameDuration(at: 0))
+    }
+
+    @discardableResult
+    mutating func advance(animation: CharacterAnimation, at date: Date) -> Int {
+        guard !animation.frames.isEmpty else {
+            animationID = animation.playbackID
+            frameIndex = 0
+            nextFrameDate = nil
+            return 0
+        }
+
+        guard animationID == animation.playbackID, let nextFrameDate else {
+            start(animation: animation, at: date)
+            return frameIndex
+        }
+
+        guard date >= nextFrameDate else { return frameIndex }
+
+        // Advance by exactly one frame. TimelineView callbacks are not
+        // guaranteed to arrive on time, so deriving the index from absolute
+        // elapsed time can skip short hatch-pet frames after a delayed refresh.
+        frameIndex = (frameIndex + 1) % animation.frames.count
+        self.nextFrameDate = date.addingTimeInterval(animation.frameDuration(at: frameIndex))
+        return frameIndex
+    }
+}
+
+final class SequentialAnimationPlaybackController: ObservableObject {
+    let animation: CharacterAnimation?
+    @Published private(set) var frameIndex = 0
+
+    private var playback = SequentialFramePlayback()
+    private var timer: Timer?
+
+    init(animation: CharacterAnimation?, startDate: Date) {
+        self.animation = animation
+        guard let animation, !animation.frames.isEmpty else { return }
+
+        let effectiveStartDate = max(startDate, Date())
+        playback.start(animation: animation, at: effectiveStartDate)
+        scheduleNext(
+            after: effectiveStartDate.timeIntervalSinceNow + animation.frameDuration(at: 0)
+        )
+    }
+
+    func stop() {
+        timer?.invalidate()
+        timer = nil
+    }
+
+    private func advanceOneFrame() {
+        guard let animation else { return }
+
+        // The timer is one-shot and the state machine advances once per fire.
+        // A late main-thread callback pauses the animation instead of catching
+        // up by skipping intermediate frames.
+        frameIndex = playback.advance(animation: animation, at: Date())
+        scheduleNext(after: animation.frameDuration(at: frameIndex))
+    }
+
+    private func scheduleNext(after delay: TimeInterval) {
+        timer?.invalidate()
+
+        let nextTimer = Timer(timeInterval: max(0.001, delay), repeats: false) { [weak self] _ in
+            self?.advanceOneFrame()
+        }
+        nextTimer.tolerance = 0
+        timer = nextTimer
+        RunLoop.main.add(nextTimer, forMode: .common)
     }
 }
 
@@ -41,7 +145,10 @@ enum HatchPetState: Int, CaseIterable {
     var frameDurations: [TimeInterval] {
         switch self {
         case .idle: [0.28, 0.11, 0.11, 0.14, 0.14, 0.32]
-        case .runningRight, .runningLeft: [0.12, 0.12, 0.12, 0.12, 0.12, 0.12, 0.12, 0.22]
+        // Pingly moves the sprite across a large desktop route at the same
+        // time as it changes poses. Give every directional stride equal,
+        // readable screen time so neither leg is perceptually favored.
+        case .runningRight, .runningLeft: [0.18, 0.18, 0.18, 0.18, 0.18, 0.18, 0.18, 0.18]
         case .waving: [0.14, 0.14, 0.14, 0.28]
         case .jumping: [0.14, 0.14, 0.14, 0.14, 0.28]
         case .failed: [0.14, 0.14, 0.14, 0.14, 0.14, 0.14, 0.14, 0.24]
@@ -98,7 +205,8 @@ enum HatchPetAtlas {
         return CharacterAnimation(
             frames: frames,
             frameDurations: state.frameDurations,
-            mirrorsForDirection: false
+            mirrorsForDirection: false,
+            usesLayerBackedFrames: true
         )
     }
 
